@@ -17,11 +17,19 @@ Plugin run modes (from reverse engineering dscu.dylib):
   9 - load GOT(s)                  (chooser / tag 'f'=102)
 
 Chooser bypass (headless support):
-  Modes 4/7/8/9 check if their netnode tag already has entries.  If so, the
-  chooser is skipped and the pre-populated items are loaded directly.  The
-  dsc_load_all tool exploits this by parsing the DSC file header to enumerate
-  all items of a given type, pre-populating the netnode, then triggering the
-  mode.
+  Modes 4/7/8/9 check (via netnode_supfirst) if their netnode tag already
+  has entries.  If so, the chooser is skipped and the pre-populated items
+  are loaded directly.  The dsc_load_all tool exploits this by reading the
+  region table (tag 'r'=114) from the '$ dscu' netnode to enumerate all
+  items of a given type, pre-populating the mode-specific tag, then
+  triggering the mode.
+
+Region info format in tag 'r' (IDA packed integers, all big-endian):
+  pack_dd(1)    — format version
+  pack_dq(addr) — region start address  (pack_dq = pack_dd(lo32) + pack_dd(hi32))
+  pack_dq(size) — region size
+  pack_dd(type) — region type (0=MODULE,1=ISLAND,2=HEADER,3=MAPPING,4=GAP,5=GOT)
+  pack_dd(...)  — additional fields (ignored by this module)
 """
 
 from __future__ import annotations
@@ -35,7 +43,7 @@ import ida_segment
 import idautils
 
 from .rpc import tool
-from .sync import idasync, IDAError
+from .sync import idasync, IDAError, tool_timeout
 from .utils import parse_address, normalize_list_input
 
 
@@ -64,6 +72,15 @@ _TAG_ISLAND = ord("g")  # 103 — branch island indices
 _TAG_MAPPING = ord("h")  # 104 — branch mapping addresses
 _TAG_GOT = ord("f")  # 102 — GOT (start_addr → end_addr)
 _TAG_GAP = ord("p")  # 112 — gap (start_addr → end_addr)
+_TAG_REGION = ord("r")  # 114 — region info (packed: ver, addr, size, type, ...)
+
+# Region types stored in tag 'r' entries (from dscu.dylib string table).
+_RT_MODULE = 0
+_RT_ISLAND = 1
+_RT_HEADER = 2
+_RT_MAPPING = 3
+_RT_GAP = 4
+_RT_GOT = 5
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +113,206 @@ def _dscu_node() -> "idaapi.netnode":
     node = idaapi.netnode()
     node.create(_DSCU_NETNODE)
     return node
+
+
+# ---------------------------------------------------------------------------
+# Helpers — IDA packed integer decoding (matches ida_netnode pack_dd/pack_dq)
+# ---------------------------------------------------------------------------
+
+
+def _unpack_dd(data: bytes, offset: int) -> tuple[int, int]:
+    """Decode a packed uint32 (IDA varint) and return (value, new_offset).
+
+    IDA stores all multi-byte cases in big-endian (network) byte order
+    via mfhtonl / mfhtons in the SDK.
+    """
+    first_byte = data[offset]
+    if first_byte < 0x80:
+        return first_byte, offset + 1
+    if first_byte < 0xC0:
+        # 2 bytes BE, mask off tag bits
+        return ((data[offset] << 8) | data[offset + 1]) & 0x3FFF, offset + 2
+    if first_byte < 0xE0:
+        # 3 bytes BE, mask off tag bits
+        return (
+            ((data[offset] << 16) | (data[offset + 1] << 8) | data[offset + 2])
+            & 0x1FFFFF
+        ), offset + 3
+    if first_byte < 0xFF:
+        # 4 bytes BE, mask off tag bits
+        return (
+            (
+                (data[offset] << 24)
+                | (data[offset + 1] << 16)
+                | (data[offset + 2] << 8)
+                | data[offset + 3]
+            )
+            & 0x0FFFFFFF
+        ), offset + 4
+    # 0xFF prefix → next 4 bytes big-endian
+    return (
+        (data[offset + 1] << 24)
+        | (data[offset + 2] << 16)
+        | (data[offset + 3] << 8)
+        | data[offset + 4]
+    ), offset + 5
+
+
+def _unpack_dq(data: bytes, offset: int) -> tuple[int, int]:
+    """Decode a packed uint64 and return (value, new_offset).
+
+    IDA encodes uint64 as two consecutive pack_dd values (lo32 then hi32).
+    """
+    low32, offset = _unpack_dd(data, offset)
+    high32, offset = _unpack_dd(data, offset)
+    return low32 | (high32 << 32), offset
+
+
+# ---------------------------------------------------------------------------
+# Helpers — dscu region enumeration from netnode tag 'r'
+# ---------------------------------------------------------------------------
+#
+# The Mach-O DSC loader stores per-region metadata in the '$ dscu' netnode
+# under tag 'r' (114).  Each entry is packed:
+#   pack_dd(1)           — format version (always 1)
+#   pack_dq(start_addr)  — region start address
+#   pack_dq(size)         — region size in bytes
+#   pack_dd(type)         — region type (_RT_* constant)
+#   ...                   — additional fields (ignored here)
+#
+# The dscu choosers enumerate these entries and filter by type.  We replicate
+# this to correctly identify GOT / gap / mapping / island regions without
+# relying on heuristics from the DSC file header.
+
+
+def _parse_region_entry(data: bytes, netnode_index: int) -> dict | None:
+    """Parse a single region info blob from tag 'r'.
+
+    The *netnode_index* is the key under which the entry is stored; it
+    equals (end_address - 1) for the region, so the true end address is
+    ``netnode_index + 1``.
+
+    Returns {"start": int, "end": int, "type": int} or None if the entry
+    cannot be parsed.
+    """
+    # Region entry tail format (confirmed from dscu.dylib reverse engineering):
+    #   pack_dd(type) pack_dd(f2) pack_dd(f3) pack_ds(name)
+    #
+    # For entries without a name (common for GOT/GAP/MAPPING/ISLAND),
+    # the tail is: [type] 00 [f3_bytes] 00
+    # where f3 is typically 0 (1 byte) or 0xFFFFFFFF (5 bytes: FF+4 BE).
+    #
+    # We extract the type from the tail rather than trying to skip the
+    # variable-length pack_dq size field whose encoding differs between
+    # IDA versions.
+    try:
+        if len(data) < 5:
+            return None
+        # Verify version = 1.
+        if data[0] >= 0x80 or data[0] != 1:
+            return None
+        # Parse start address: pack_dd(lo32) + pack_dd(hi32).
+        offset = 1
+        start_lo, offset = _unpack_dd(data, offset)
+        start_hi, offset = _unpack_dd(data, offset)
+        start_addr = start_lo | (start_hi << 32)
+        end_addr = netnode_index + 1
+        # Extract region type from the tail.
+        region_type = _extract_type_from_tail(data)
+        if region_type is None:
+            return None
+        return {
+            "start": start_addr,
+            "end": end_addr,
+            "type": region_type,
+        }
+    except (IndexError, struct.error):
+        return None
+
+
+def _extract_type_from_tail(data: bytes) -> int | None:
+    """Extract the region type by parsing the entry tail backwards.
+
+    Tail layout: pack_dd(type) pack_dd(f2) pack_dd(f3) pack_ds(name)
+
+    Common tail patterns (from the end of the blob):
+      - No name, f3=0xFFFFFFFF:  [type] 00 FF FF FF FF FF 00  (8 bytes)
+      - No name, f3=0:           [type] 00 00 00              (4 bytes)
+      - With name of length N:   [type] ... pack_dd(N) <N bytes>
+    """
+    length = len(data)
+    # Pattern 1: tail = [type] 00 FF FF FF FF FF 00 (8 bytes, no name, f3=max)
+    if length >= 8 and data[-7:] == b"\x00\xff\xff\xff\xff\xff\x00":
+        candidate = data[-8]
+        if candidate <= _RT_GOT:
+            return candidate
+    # Pattern 2: tail = [type] 00 00 00 (4 bytes, no name, f2=0, f3=0)
+    if length >= 4 and data[-3:] == b"\x00\x00\x00":
+        candidate = data[-4]
+        if candidate <= _RT_GOT:
+            return candidate
+    # Pattern 3: named entry — parse pack_ds(name) from the end, then
+    # work backwards through f3, f2, to reach type.
+    # Find name: the last field is pack_ds = pack_dd(len) + len bytes.
+    # We try small name lengths (most section names are < 40 bytes).
+    for name_len in range(0, 60):
+        # pack_dd(name_len) has known encoding size:
+        if name_len < 0x80:
+            dd_size = 1
+        elif name_len < 0x4000:
+            dd_size = 2
+        else:
+            dd_size = 3
+        name_field_size = dd_size + name_len
+        tail_start = length - name_field_size
+        if tail_start < 4:
+            break
+        # Verify: decode pack_dd at tail_start should give name_len.
+        try:
+            decoded_len, _ = _unpack_dd(data, tail_start)
+        except (IndexError, struct.error):
+            continue
+        if decoded_len != name_len:
+            continue
+        # Found valid name field. Now parse f3, f2, type backwards.
+        # f3 is right before name. Try common f3 encodings.
+        pos = tail_start
+        # Try f3 = 0xFFFFFFFF (5 bytes: FF + 4 BE bytes all FF)
+        if pos >= 5 and data[pos - 5 : pos] == b"\xff\xff\xff\xff\xff":
+            pos -= 5
+        # Try f3 as small value (1 byte, < 0x80)
+        elif pos >= 1 and data[pos - 1] < 0x80:
+            pos -= 1
+        else:
+            continue
+        # f2: expect small value (1 byte)
+        if pos >= 1 and data[pos - 1] < 0x80:
+            pos -= 1
+        else:
+            continue
+        # type: should be 0..5
+        if pos >= 1 and data[pos - 1] <= _RT_GOT:
+            return data[pos - 1]
+    return None
+
+
+def _enumerate_dscu_regions(type_filter: int) -> list[dict]:
+    """Return all dscu region entries matching *type_filter*.
+
+    Reads tag 'r' from the '$ dscu' netnode and returns regions whose
+    type field equals *type_filter* (one of the _RT_* constants).
+    """
+    node = _dscu_node()
+    regions: list[dict] = []
+    index = node.supfirst(_TAG_REGION)
+    while index != idaapi.BADNODE:
+        data = node.supval(index, _TAG_REGION)
+        if data:
+            info = _parse_region_entry(data, index)
+            if info is not None and info["type"] == type_filter:
+                regions.append(info)
+        index = node.supnext(index, _TAG_REGION)
+    return regions
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +438,7 @@ def _parse_dsc_mappings() -> list[dict]:
 
 @tool
 @idasync
+@tool_timeout(600.0)
 def dsc_load_module(
     modules: Annotated[
         list[str] | str,
@@ -255,6 +473,7 @@ def dsc_load_module(
 
 @tool
 @idasync
+@tool_timeout(600.0)
 def dsc_load_section(
     addresses: Annotated[
         list[str] | str,
@@ -318,6 +537,7 @@ def dsc_load_dyld_header() -> dict:
 
 @tool
 @idasync
+@tool_timeout(600.0)
 def dsc_resolve_unmapped(
     limit: Annotated[
         int,
@@ -413,6 +633,7 @@ def dsc_list_modules() -> dict:
 
 @tool
 @idasync
+@tool_timeout(600.0)
 def dsc_load_all(
     region_type: Annotated[
         str,
@@ -491,79 +712,74 @@ def _load_all_islands() -> dict:
 def _load_all_mappings() -> dict:
     """Load all branch mappings via tag 'h' pre-population.
 
-    Enumerates mappings from the DSC header and marks all executable
-    non-primary mappings as branch mapping candidates.
+    Reads the '$ dscu' netnode tag 'r' to find regions with type RT_MAPPING,
+    then pre-populates tag 'h' (start_addr → flag=1) and triggers mode 7.
     """
-    mappings = _parse_dsc_mappings()
-    if not mappings:
-        return {"error": "No mappings found in DSC header"}
+    regions = _enumerate_dscu_regions(_RT_MAPPING)
+    if not regions:
+        return {"error": "No branch mapping regions found in dscu region table"}
 
-    # Branch mappings are executable (maxProt & 4 == PROT_EXEC) non-primary
-    # mappings.  The first mapping is always the primary __TEXT mapping.
     node = _dscu_node()
-    val = struct.pack("<Q", 1)
-    loaded = 0
-    for m in mappings[1:]:  # skip primary __TEXT mapping
-        if m["maxProt"] & 4:  # VM_PROT_EXECUTE
-            addr = int(m["address"], 16)
-            node.supset(addr, val, _TAG_MAPPING)
-            loaded += 1
-
-    if loaded == 0:
-        return {"error": "No branch mappings detected in mappings table"}
+    flag_value = struct.pack("<Q", 1)
+    for region in regions:
+        node.supset(region["start"], flag_value, _TAG_MAPPING)
     _run_dscu(_MODE_LOAD_MAPPING)
-    return {"ok": True, "loaded": loaded}
+    return {"ok": True, "loaded": len(regions)}
 
 
 def _load_all_gots() -> dict:
     """Load all GOTs via tag 'f' pre-population.
 
-    Enumerates mappings from the DSC header and marks all non-executable
-    data mappings as GOT candidates (address → end address).
+    Reads the '$ dscu' netnode tag 'r' to find regions with type RT_GOT,
+    then pre-populates tag 'f' (start_addr → end_addr) and triggers mode 9.
     """
-    mappings = _parse_dsc_mappings()
-    if not mappings:
-        return {"error": "No mappings found in DSC header"}
+    regions = _enumerate_dscu_regions(_RT_GOT)
+    if not regions:
+        return {"error": "No GOT regions found in dscu region table"}
 
-    # GOT regions are data mappings (no PROT_EXEC, but with PROT_READ)
-    # that are not the primary __TEXT mapping.
+    region_details = [
+        {"start": hex(r["start"]), "end": hex(r["end"]), "size": hex(r["size"])}
+        for r in regions
+    ]
     node = _dscu_node()
-    loaded = 0
-    for m in mappings[1:]:  # skip primary __TEXT mapping
-        if not (m["maxProt"] & 4):  # not VM_PROT_EXECUTE → data mapping
-            addr = int(m["address"], 16)
-            end = int(m["end"], 16)
-            node.supset(addr, struct.pack("<Q", end), _TAG_GOT)
-            loaded += 1
-
-    if loaded == 0:
-        return {"error": "No GOT regions detected in mappings table"}
-    _run_dscu(_MODE_LOAD_GOT)
-    return {"ok": True, "loaded": loaded}
+    for region in regions:
+        node.supset(
+            region["start"], struct.pack("<Q", region["end"]), _TAG_GOT
+        )
+    try:
+        _run_dscu(_MODE_LOAD_GOT)
+    except Exception as exc:
+        return {
+            "error": f"reload_file_ex failed after pre-populating "
+            f"{len(regions)} GOT region(s): {exc}",
+            "regions": region_details,
+        }
+    return {"ok": True, "loaded": len(regions)}
 
 
 def _load_all_gaps() -> dict:
     """Load all gaps via tag 'p' pre-population.
 
-    Gaps are unmapped address ranges between consecutive mappings.
+    Reads the '$ dscu' netnode tag 'r' to find regions with type RT_GAP,
+    then pre-populates tag 'p' (start_addr → end_addr) and triggers mode 8.
     """
-    mappings = _parse_dsc_mappings()
-    if len(mappings) < 2:
-        return {"error": "Not enough mappings to detect gaps"}
+    regions = _enumerate_dscu_regions(_RT_GAP)
+    if not regions:
+        return {"error": "No gap regions found in dscu region table"}
 
     node = _dscu_node()
-    loaded = 0
-    for i in range(len(mappings) - 1):
-        cur_end = int(mappings[i]["address"], 16) + int(mappings[i]["size"], 16)
-        next_start = int(mappings[i + 1]["address"], 16)
-        if next_start > cur_end:
-            node.supset(cur_end, struct.pack("<Q", next_start), _TAG_GAP)
-            loaded += 1
-
-    if loaded == 0:
-        return {"error": "No gaps detected between mappings"}
-    _run_dscu(_MODE_LOAD_GAP)
-    return {"ok": True, "loaded": loaded}
+    for region in regions:
+        node.supset(
+            region["start"], struct.pack("<Q", region["end"]), _TAG_GAP
+        )
+    try:
+        _run_dscu(_MODE_LOAD_GAP)
+    except Exception as exc:
+        return {
+            "error": f"reload_file_ex failed after pre-populating "
+            f"{len(regions)} gap region(s): {exc}",
+        }
+    return {"ok": True, "loaded": len(regions)}
 
 
 # ---------------------------------------------------------------------------
@@ -600,15 +816,16 @@ def dsc_load_dependency() -> dict:
 
 @tool
 @idasync
+@tool_timeout(600.0)
 def dsc_load_branch_island() -> dict:
-    """Open the branch island chooser to load branch island regions.
+    """Load all branch island regions from the shared cache.
 
     Branch islands are intermediate stub sequences used by the dyld shared
     cache to bridge calls between distant modules.  Loading them resolves
     indirect branches (e.g. turns 'BL loc_...' into 'BL _objc_msgSend').
 
-    Shows a multi-select chooser in IDA.  For headless use, call
-    dsc_load_all("island") instead.
+    In GUI mode this shows a multi-select chooser; in headless mode it
+    automatically loads all available branch islands.
 
     The current database must have been opened from a dyld shared cache using
     the "single module" option.
@@ -617,21 +834,24 @@ def dsc_load_branch_island() -> dict:
     try:
         _run_dscu(_MODE_LOAD_ISLAND)
         return {"ok": True}
-    except Exception as exc:
-        return {"error": str(exc)}
+    except Exception:
+        pass
+    # Chooser failed (headless mode) — load all islands instead.
+    return _load_all_islands()
 
 
 @tool
 @idasync
+@tool_timeout(600.0)
 def dsc_load_branch_mapping() -> dict:
-    """Open the branch mapping chooser to load branch stub mapping regions.
+    """Load all branch stub mapping regions from the shared cache.
 
     Branch mappings (iOS 16+) contain stub code that routes calls between
     modules in the shared cache.  Loading them is essential for resolving
     cross-module function calls.
 
-    Shows a multi-select chooser in IDA.  For headless use, call
-    dsc_load_all("mapping") instead.
+    In GUI mode this shows a multi-select chooser; in headless mode it
+    automatically loads all available branch mappings.
 
     The current database must have been opened from a dyld shared cache using
     the "single module" option.
@@ -640,21 +860,24 @@ def dsc_load_branch_mapping() -> dict:
     try:
         _run_dscu(_MODE_LOAD_MAPPING)
         return {"ok": True}
-    except Exception as exc:
-        return {"error": str(exc)}
+    except Exception:
+        pass
+    # Chooser failed (headless mode) — load all mappings instead.
+    return _load_all_mappings()
 
 
 @tool
 @idasync
+@tool_timeout(600.0)
 def dsc_load_got() -> dict:
-    """Open the GOT chooser to load global offset table regions.
+    """Load all global offset table regions from the shared cache.
 
     Global offset tables (iOS 16+) contain pointers used for inter-module
     symbol resolution.  Loading and symbolicating them helps IDA resolve
     indirect data references.
 
-    Shows a multi-select chooser in IDA.  For headless use, call
-    dsc_load_all("got") instead.
+    In GUI mode this shows a multi-select chooser; in headless mode it
+    automatically loads all available GOTs.
 
     The current database must have been opened from a dyld shared cache using
     the "single module" option.
@@ -663,20 +886,23 @@ def dsc_load_got() -> dict:
     try:
         _run_dscu(_MODE_LOAD_GOT)
         return {"ok": True}
-    except Exception as exc:
-        return {"error": str(exc)}
+    except Exception:
+        pass
+    # Chooser failed (headless mode) — load all GOTs instead.
+    return _load_all_gots()
 
 
 @tool
 @idasync
+@tool_timeout(600.0)
 def dsc_load_gap() -> dict:
-    """Open the gap chooser to load gap regions from the shared cache.
+    """Load all gap regions from the shared cache.
 
     Gaps are unmapped regions between modules in the dyld shared cache.
     Loading them can reveal data or code that IDA did not initially map.
 
-    Shows a multi-select chooser in IDA.  For headless use, call
-    dsc_load_all("gap") instead.
+    In GUI mode this shows a multi-select chooser; in headless mode it
+    automatically loads all available gap regions.
 
     The current database must have been opened from a dyld shared cache using
     the "single module" option.
@@ -685,5 +911,7 @@ def dsc_load_gap() -> dict:
     try:
         _run_dscu(_MODE_LOAD_GAP)
         return {"ok": True}
-    except Exception as exc:
-        return {"error": str(exc)}
+    except Exception:
+        pass
+    # Chooser failed (headless mode) — load all gaps instead.
+    return _load_all_gaps()
