@@ -337,20 +337,6 @@ def _enumerate_dscu_regions(type_filter: int) -> list[dict]:
 #   0x1C  uint32   pad
 
 
-def _read_cstring(f, offset: int) -> str:
-    """Read a null-terminated UTF-8 string from file at *offset*."""
-    saved = f.tell()
-    f.seek(offset)
-    parts: list[bytes] = []
-    while True:
-        c = f.read(1)
-        if not c or c == b"\x00":
-            break
-        parts.append(c)
-    f.seek(saved)
-    return b"".join(parts).decode("utf-8", errors="replace")
-
-
 def _dsc_path() -> str:
     """Return the filesystem path of the input dyld shared cache."""
     path = ida_nalt.get_input_file_path()
@@ -361,28 +347,12 @@ def _dsc_path() -> str:
 
 def _parse_dsc_modules() -> list[dict]:
     """Parse the DSC header and return all cached images (modules)."""
-    path = _dsc_path()
-    with open(path, "rb") as f:
-        magic = f.read(16)
-        if not magic.startswith(b"dyld_v"):
-            raise IDAError("Input file is not a dyld shared cache")
+    from ida_pro_mcp.dsc_parser import list_dsc_images
 
-        f.seek(0x18)
-        images_offset, images_count = struct.unpack("<II", f.read(8))
-        if images_count == 0 or images_offset == 0:
-            raise IDAError("No images found in DSC header")
-
-        modules: list[dict] = []
-        f.seek(images_offset)
-        for i in range(images_count):
-            entry = f.read(32)
-            if len(entry) < 32:
-                break
-            addr = struct.unpack_from("<Q", entry, 0)[0]
-            path_off = struct.unpack_from("<I", entry, 0x18)[0]
-            mod_path = _read_cstring(f, path_off)
-            modules.append({"index": i, "address": hex(addr), "path": mod_path})
-        return modules
+    try:
+        return list_dsc_images(_dsc_path())
+    except ValueError as exc:
+        raise IDAError(str(exc)) from exc
 
 
 def _parse_dsc_branch_pool_count() -> int:

@@ -4,6 +4,7 @@ This module provides session management for multiple IDA databases in idalib mod
 Each session represents an opened binary with its own IDA database instance.
 """
 
+import os
 import uuid
 import threading
 import logging
@@ -121,6 +122,106 @@ class IDASessionManager:
                 logger.info(f"Auto-analysis completed (session: {session_id})")
 
             logger.info(f"Session created: {session_id} for {input_path.name}")
+            return session_id
+
+    def open_dsc(
+        self,
+        input_path: Path | str,
+        module: Optional[str] = None,
+        dependency_depth: int = 0,
+        run_auto_analysis: bool = True,
+        session_id: Optional[str] = None,
+    ) -> str:
+        """Open a dyld shared cache file and create a new session.
+
+        The Mach-O loader uses environment variables to control DSC loading:
+        - IDA_DYLD_CACHE_MODULE: module path for single-module mode
+        - IDA_DYLD_CACHE_DEPTH: dependency loading depth (-1 = all)
+
+        Args:
+            input_path: Path to the dyld shared cache file
+            module: Module path to load (e.g. "/usr/lib/libobjc.A.dylib").
+                    If None, loads the complete cache image.
+            dependency_depth: Depth of dependency loading (0 = module only, -1 = all)
+            run_auto_analysis: Whether to run auto-analysis
+            session_id: Optional custom session ID (auto-generated if not provided)
+
+        Returns:
+            Session ID for the opened DSC
+
+        Raises:
+            FileNotFoundError: If the input file doesn't exist
+            RuntimeError: If failed to open the database
+        """
+        input_path = Path(input_path)
+
+        if not input_path.exists():
+            raise FileNotFoundError(f"Input file not found: {input_path}")
+
+        with self._lock:
+            # Generate session ID
+            if session_id is None:
+                session_id = str(uuid.uuid4())[:8]
+            elif session_id in self._sessions:
+                raise ValueError(f"Session already exists: {session_id}")
+
+            dsc_mode = "single_module" if module else "complete_image"
+            logger.info(
+                "Opening DSC: %s (mode=%s, module=%s, depth=%d, session=%s)",
+                input_path, dsc_mode, module, dependency_depth, session_id,
+            )
+
+            # Set loader environment variables, then restore after open_database
+            saved_env: dict[str, Optional[str]] = {}
+            try:
+                if module:
+                    saved_env["IDA_DYLD_CACHE_MODULE"] = os.environ.get(
+                        "IDA_DYLD_CACHE_MODULE"
+                    )
+                    os.environ["IDA_DYLD_CACHE_MODULE"] = module
+
+                saved_env["IDA_DYLD_CACHE_DEPTH"] = os.environ.get(
+                    "IDA_DYLD_CACHE_DEPTH"
+                )
+                os.environ["IDA_DYLD_CACHE_DEPTH"] = str(dependency_depth)
+
+                self._activate_database_path(
+                    str(input_path), run_auto_analysis=run_auto_analysis
+                )
+            finally:
+                for key, old_value in saved_env.items():
+                    if old_value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = old_value
+
+            # Create session object with DSC metadata
+            session = IDASession(
+                session_id=session_id,
+                input_path=input_path,
+                is_analyzing=run_auto_analysis,
+                metadata={
+                    "dsc_mode": dsc_mode,
+                    "dsc_module": module,
+                    "dependency_depth": dependency_depth,
+                },
+            )
+
+            self._sessions[session_id] = session
+            self._active_session_id = session_id
+
+            if run_auto_analysis:
+                logger.debug(
+                    "Waiting for auto-analysis to complete (session: %s)", session_id
+                )
+                ida_auto.auto_wait()
+                session.is_analyzing = False
+                logger.info("Auto-analysis completed (session: %s)", session_id)
+
+            logger.info(
+                "DSC session created: %s for %s (%s)",
+                session_id, input_path.name, dsc_mode,
+            )
             return session_id
 
     def close_session(self, session_id: str) -> bool:

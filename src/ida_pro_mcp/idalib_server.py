@@ -107,7 +107,9 @@ logger = logging.getLogger(__name__)
 STDIO_DEFAULT_CONTEXT_ID = "stdio:default"
 SHARED_FALLBACK_CONTEXT_ID = "shared:fallback"
 IDALIB_MANAGEMENT_TOOLS = {
+    "idalib_dsc_info",
     "idalib_open",
+    "idalib_open_dsc",
     "idalib_close",
     "idalib_switch",
     "idalib_unbind",
@@ -194,6 +196,37 @@ def _install_context_activation_hooks() -> None:
 
 
 @tool
+def idalib_dsc_info(
+    input_path: Annotated[str, "Path to the dyld shared cache file"],
+    filter: Annotated[
+        Optional[str],
+        "Optional substring filter for module paths (case-insensitive). "
+        'E.g. "AppKit", "libobjc", "UIKit".',
+    ] = None,
+) -> dict:
+    """List all modules in a dyld shared cache file (no open database required).
+
+    Parses the DSC header directly from disk and returns every cached image
+    with its path and load address.  Use the paths returned here as the
+    `module` argument to idalib_open_dsc.
+    """
+    try:
+        from ida_pro_mcp.dsc_parser import list_dsc_images
+
+        modules = list_dsc_images(input_path)
+        if filter:
+            filter_lower = filter.lower()
+            modules = [
+                module
+                for module in modules
+                if filter_lower in module["path"].lower()
+            ]
+        return {"count": len(modules), "modules": modules}
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        return {"error": str(exc)}
+
+
+@tool
 def idalib_open(
     input_path: Annotated[str, "Path to the binary file to analyze"],
     run_auto_analysis: Annotated[bool, "Run automatic analysis on the binary"] = True,
@@ -217,6 +250,71 @@ def idalib_open(
             "message": (
                 f"Binary opened and bound to context: {session.input_path.name} "
                 f"({opened_session_id})"
+            ),
+        }
+    except (FileNotFoundError, RuntimeError, ValueError) as e:
+        return {"error": str(e)}
+    except Exception as e:
+        return {"error": f"Unexpected error: {e}"}
+
+
+@tool
+def idalib_open_dsc(
+    input_path: Annotated[str, "Path to the dyld shared cache file"],
+    module: Annotated[
+        Optional[str],
+        "Module path inside the cache to load in single-module mode "
+        '(e.g. "/usr/lib/libobjc.A.dylib"). '
+        "If omitted, loads the complete cache image.",
+    ] = None,
+    dependency_depth: Annotated[
+        int,
+        "Depth of dependency loading when using single-module mode. "
+        "0 loads only the module itself, -1 loads all dependencies. Default: 0.",
+    ] = 0,
+    run_auto_analysis: Annotated[bool, "Run automatic analysis on the binary"] = True,
+    session_id: Annotated[
+        Optional[str], "Custom session ID (auto-generated if not provided)"
+    ] = None,
+) -> dict:
+    """Open a dyld shared cache (DSC) file and bind it to the active context.
+
+    Unlike idalib_open, this tool lets you choose between two DSC loading modes:
+
+    1. **Single-module mode** (recommended): specify `module` to load one module
+       from the cache. After opening you can load additional modules, GOTs, branch
+       islands, etc. via the dsc_load_* tools.
+    2. **Complete-image mode**: omit `module` to load the entire cache contents.
+       This produces a very large database and is only useful for whole-cache
+       analysis.
+
+    The `dependency_depth` parameter controls how many transitive dependencies
+    are pulled in automatically when loading a single module (default 0 = module
+    only, use -1 for all).
+    """
+
+    try:
+        manager = get_session_manager()
+        context_id = _resolve_effective_context_id()
+        opened_session_id = manager.open_dsc(
+            Path(input_path),
+            module=module,
+            dependency_depth=dependency_depth,
+            run_auto_analysis=run_auto_analysis,
+            session_id=session_id,
+        )
+        session = manager.bind_context(context_id, opened_session_id, activate=True)
+        mode = "single_module" if module else "complete_image"
+        return {
+            "success": True,
+            **_context_response_fields(context_id),
+            "session": session.to_dict(),
+            "dsc_mode": mode,
+            "dsc_module": module,
+            "message": (
+                f"DSC opened ({mode}): {session.input_path.name} "
+                f"({opened_session_id})"
+                + (f" — module: {module}" if module else "")
             ),
         }
     except (FileNotFoundError, RuntimeError, ValueError) as e:
