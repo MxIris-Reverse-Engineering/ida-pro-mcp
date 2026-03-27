@@ -127,21 +127,28 @@ class IDASessionManager:
     def open_dsc(
         self,
         input_path: Path | str,
-        module: Optional[str] = None,
+        module: str,
+        idb_name: Optional[str] = None,
         dependency_depth: int = 0,
         run_auto_analysis: bool = True,
         session_id: Optional[str] = None,
     ) -> str:
-        """Open a dyld shared cache file and create a new session.
+        """Open a single module from a dyld shared cache file.
 
         The Mach-O loader uses environment variables to control DSC loading:
         - IDA_DYLD_CACHE_MODULE: module path for single-module mode
         - IDA_DYLD_CACHE_DEPTH: dependency loading depth (-1 = all)
 
+        To produce a custom IDB filename (e.g. ``SwiftUI.i64``), a temporary
+        symlink is created in the same directory as the cache so that IDA
+        names the database after the symlink.  The symlink is removed once
+        the database is open.
+
         Args:
             input_path: Path to the dyld shared cache file
             module: Module path to load (e.g. "/usr/lib/libobjc.A.dylib").
-                    If None, loads the complete cache image.
+            idb_name: Custom base name for the .i64 file.  Defaults to the
+                      module's file name (last path component).
             dependency_depth: Depth of dependency loading (0 = module only, -1 = all)
             run_auto_analysis: Whether to run auto-analysis
             session_id: Optional custom session ID (auto-generated if not provided)
@@ -159,26 +166,47 @@ class IDASessionManager:
             raise FileNotFoundError(f"Input file not found: {input_path}")
 
         with self._lock:
-            # Generate session ID
             if session_id is None:
                 session_id = str(uuid.uuid4())[:8]
             elif session_id in self._sessions:
                 raise ValueError(f"Session already exists: {session_id}")
 
-            dsc_mode = "single_module" if module else "complete_image"
+            # Resolve the base name for the IDB file
+            if idb_name is None:
+                # Derive from module path, e.g. ".../AppKit" -> "AppKit"
+                idb_name = Path(module).name
+
             logger.info(
-                "Opening DSC: %s (mode=%s, module=%s, depth=%d, session=%s)",
-                input_path, dsc_mode, module, dependency_depth, session_id,
+                "Opening DSC: %s (module=%s, idb=%s, depth=%d, session=%s)",
+                input_path, module, idb_name, dependency_depth, session_id,
             )
 
-            # Set loader environment variables, then restore after open_database
+            # Create a symlink in the cache directory so IDA names the IDB
+            # after the symlink rather than the cache file.
+            symlink_path: Optional[Path] = None
+            effective_path = str(input_path)
+
+            if idb_name != input_path.name:
+                symlink_path = input_path.parent / idb_name
+                if symlink_path.exists() or symlink_path.is_symlink():
+                    # Reuse existing file/symlink
+                    logger.debug("IDB name target already exists: %s", symlink_path)
+                else:
+                    symlink_path.symlink_to(input_path.name)
+                    logger.debug("Created symlink: %s -> %s", symlink_path, input_path.name)
+                effective_path = str(symlink_path)
+
+            # Set loader environment variables, then restore after open_database.
+            # NOTE: os.environ is process-global; the session manager lock
+            # serialises DSC opens but other threads could observe these
+            # values during the window.  This is acceptable because idalib
+            # itself is single-threaded.
             saved_env: dict[str, Optional[str]] = {}
             try:
-                if module:
-                    saved_env["IDA_DYLD_CACHE_MODULE"] = os.environ.get(
-                        "IDA_DYLD_CACHE_MODULE"
-                    )
-                    os.environ["IDA_DYLD_CACHE_MODULE"] = module
+                saved_env["IDA_DYLD_CACHE_MODULE"] = os.environ.get(
+                    "IDA_DYLD_CACHE_MODULE"
+                )
+                os.environ["IDA_DYLD_CACHE_MODULE"] = module
 
                 saved_env["IDA_DYLD_CACHE_DEPTH"] = os.environ.get(
                     "IDA_DYLD_CACHE_DEPTH"
@@ -186,7 +214,7 @@ class IDASessionManager:
                 os.environ["IDA_DYLD_CACHE_DEPTH"] = str(dependency_depth)
 
                 self._activate_database_path(
-                    str(input_path), run_auto_analysis=run_auto_analysis
+                    effective_path, run_auto_analysis=run_auto_analysis
                 )
             finally:
                 for key, old_value in saved_env.items():
@@ -194,15 +222,23 @@ class IDASessionManager:
                         os.environ.pop(key, None)
                     else:
                         os.environ[key] = old_value
+                # NOTE: do NOT remove the symlink here.  The dscu plugin
+                # uses ida_nalt.get_input_file_path() (which returns the
+                # symlink path) throughout the session to read DSC data
+                # during reload_file_ex.  Removing it breaks dsc_load_*.
 
-            # Create session object with DSC metadata
+            # Track the effective path (symlink target dir + idb_name) so
+            # session switching can find the IDB later.
+            tracked_path = Path(effective_path)
+
             session = IDASession(
                 session_id=session_id,
-                input_path=input_path,
+                input_path=tracked_path,
                 is_analyzing=run_auto_analysis,
                 metadata={
-                    "dsc_mode": dsc_mode,
+                    "dsc_path": str(input_path),
                     "dsc_module": module,
+                    "idb_name": idb_name,
                     "dependency_depth": dependency_depth,
                 },
             )
@@ -219,8 +255,8 @@ class IDASessionManager:
                 logger.info("Auto-analysis completed (session: %s)", session_id)
 
             logger.info(
-                "DSC session created: %s for %s (%s)",
-                session_id, input_path.name, dsc_mode,
+                "DSC session created: %s for %s (module=%s)",
+                session_id, idb_name, module,
             )
             return session_id
 
@@ -245,6 +281,9 @@ class IDASessionManager:
             if self._active_session_id == session_id:
                 idapro.close_database()
                 self._active_session_id = None
+
+            # Clean up DSC symlink if this was a DSC session
+            self._cleanup_dsc_symlink(session)
 
             # Remove session
             del self._sessions[session_id]
@@ -362,6 +401,8 @@ class IDASessionManager:
                 idapro.close_database()
                 self._active_session_id = None
 
+            for session in self._sessions.values():
+                self._cleanup_dsc_symlink(session)
             self._sessions.clear()
             self._context_bindings.clear()
             logger.info("All sessions closed")
@@ -384,6 +425,21 @@ class IDASessionManager:
 
         if idapro.open_database(input_path, run_auto_analysis=run_auto_analysis):
             raise RuntimeError(f"Failed to open database: {input_path}")
+
+    @staticmethod
+    def _cleanup_dsc_symlink(session: IDASession) -> None:
+        """Remove the DSC symlink created by open_dsc, if any."""
+        dsc_path = session.metadata.get("dsc_path")
+        if not dsc_path:
+            return
+        # The symlink is input_path itself (e.g. .../AppKit -> dyld_shared_cache_arm64e)
+        symlink = session.input_path
+        if symlink.is_symlink():
+            try:
+                symlink.unlink()
+                logger.debug("Removed DSC symlink: %s", symlink)
+            except OSError:
+                pass
 
     def _unbind_session_everywhere_locked(self, session_id: str) -> None:
         stale_contexts = [

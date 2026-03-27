@@ -9,12 +9,12 @@ from __future__ import annotations
 import struct
 
 
-def read_cstring(file_object, offset: int) -> str:
+def read_cstring(file_object, offset: int, max_length: int = 4096) -> str:
     """Read a null-terminated UTF-8 string from *file_object* at *offset*."""
     saved = file_object.tell()
     file_object.seek(offset)
     parts: list[bytes] = []
-    while True:
+    for _ in range(max_length):
         byte = file_object.read(1)
         if not byte or byte == b"\x00":
             break

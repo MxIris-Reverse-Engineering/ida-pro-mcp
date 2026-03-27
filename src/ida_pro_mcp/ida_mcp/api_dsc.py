@@ -58,7 +58,6 @@ _DSCU_PLUGIN = "dscu"
 _MODE_LOAD_MODULE = 1
 _MODE_LOAD_SECTION = 2
 _MODE_LOAD_ISLAND = 4
-_MODE_LOAD_DEPENDENCY = 5
 _MODE_LOAD_HEADER = 6
 _MODE_LOAD_MAPPING = 7
 _MODE_LOAD_GAP = 8
@@ -67,7 +66,6 @@ _MODE_LOAD_GOT = 9
 # Netnode tag chars used by the Mach-O DSC loader during reload_file_ex.
 # Pre-populating these tags before calling the corresponding mode makes the
 # dscu handler skip the GUI chooser and load the items directly.
-_TAG_MODULE = ord("t")  # 116 — module indices
 _TAG_ISLAND = ord("g")  # 103 — branch island indices
 _TAG_MAPPING = ord("h")  # 104 — branch mapping addresses
 _TAG_GOT = ord("f")  # 102 — GOT (start_addr → end_addr)
@@ -75,6 +73,8 @@ _TAG_GAP = ord("p")  # 112 — gap (start_addr → end_addr)
 _TAG_REGION = ord("r")  # 114 — region info (packed: ver, addr, size, type, ...)
 
 # Region types stored in tag 'r' entries (from dscu.dylib string table).
+# All values defined for reference; only _RT_MAPPING/_RT_GAP/_RT_GOT are
+# used as filters — islands use branch pool count instead.
 _RT_MODULE = 0
 _RT_ISLAND = 1
 _RT_HEADER = 2
@@ -99,13 +99,21 @@ def _ensure_dscu() -> None:
         )
 
 
-def _run_dscu(mode: int) -> None:
+def _run_dscu(mode: int, *, ignore_rc: bool = False) -> bool:
     """Run the dscu plugin with the given mode.
 
-    Raises IDAError if the plugin could not be loaded.
+    Returns the boolean result of load_and_run_plugin.
+
+    When *ignore_rc* is False (the default), raises IDAError if the plugin
+    returns False.  When *ignore_rc* is True the return code is passed
+    through without raising — this is needed for chooser-based modes
+    (4/7/8/9) that return False in headless/idalib even when the
+    underlying load operation succeeded.
     """
-    if not idaapi.load_and_run_plugin(_DSCU_PLUGIN, mode):
+    result = idaapi.load_and_run_plugin(_DSCU_PLUGIN, mode)
+    if not result and not ignore_rc:
         raise IDAError(f"dscu plugin failed to execute (mode {mode})")
+    return result
 
 
 def _dscu_node() -> "idaapi.netnode":
@@ -209,7 +217,7 @@ def _parse_region_entry(data: bytes, netnode_index: int) -> dict | None:
         if len(data) < 5:
             return None
         # Verify version = 1.
-        if data[0] >= 0x80 or data[0] != 1:
+        if data[0] != 1:
             return None
         # Parse start address: pack_dd(lo32) + pack_dd(hi32).
         offset = 1
@@ -360,45 +368,9 @@ def _parse_dsc_branch_pool_count() -> int:
     path = _dsc_path()
     with open(path, "rb") as f:
         header = f.read(0x78)
-    if len(header) < 0x78 or not header[:4].startswith(b"dyld"):
+    if len(header) < 0x78 or not header[:16].startswith(b"dyld_v"):
         return 0
     return struct.unpack_from("<I", header, 0x74)[0]
-
-
-def _parse_dsc_mappings() -> list[dict]:
-    """Parse cache mapping entries from the DSC header.
-
-    Returns basic mapping info (address, size, fileOffset, maxProt, initProt).
-    """
-    path = _dsc_path()
-    with open(path, "rb") as f:
-        f.seek(0x10)
-        mapping_offset, mapping_count = struct.unpack("<II", f.read(8))
-        if mapping_count == 0 or mapping_offset == 0:
-            return []
-
-        # dyld_cache_mapping_info: 32 bytes
-        # address(8) + size(8) + fileOffset(8) + maxProt(4) + initProt(4)
-        f.seek(mapping_offset)
-        mappings: list[dict] = []
-        for _ in range(mapping_count):
-            data = f.read(32)
-            if len(data) < 32:
-                break
-            addr, size, file_off, max_prot, init_prot = struct.unpack_from(
-                "<QQQII", data
-            )
-            mappings.append(
-                {
-                    "address": hex(addr),
-                    "size": hex(size),
-                    "end": hex(addr + size),
-                    "fileOffset": hex(file_off),
-                    "maxProt": max_prot,
-                    "initProt": init_prot,
-                }
-            )
-        return mappings
 
 
 # ---------------------------------------------------------------------------
@@ -474,8 +446,14 @@ def dsc_load_section(
             ea = parse_address(addr_str)
             node = _dscu_node()
             node.altset(3, ea)
-            _run_dscu(_MODE_LOAD_SECTION)
-            results.append({"addr": hex(ea), "ok": True})
+            # ignore_rc=True: dscu mode 2 returns False in headless mode
+            # even when the region is loaded successfully.
+            _run_dscu(_MODE_LOAD_SECTION, ignore_rc=True)
+            # Verify the segment was actually created.
+            if ida_segment.getseg(ea) is not None:
+                results.append({"addr": hex(ea), "ok": True})
+            else:
+                results.append({"addr": hex(ea), "error": "Region not loaded (address may not belong to a DSC region)"})
         except Exception as exc:
             results.append({"addr": addr_str, "error": str(exc)})
     return results
@@ -561,13 +539,17 @@ def dsc_resolve_unmapped(
         return {"ok": True, "loaded": 0, "message": "No unmapped references found"}
 
     # Load each unmapped region via mode 2 (auto-detect type).
+    # ignore_rc=True: dscu mode 2 returns False in headless mode even on success.
     results: list[dict] = []
     for ea in unmapped_addrs:
         try:
             node = _dscu_node()
             node.altset(3, ea)
-            _run_dscu(_MODE_LOAD_SECTION)
-            results.append({"addr": hex(ea), "ok": True})
+            _run_dscu(_MODE_LOAD_SECTION, ignore_rc=True)
+            if ida_segment.getseg(ea) is not None:
+                results.append({"addr": hex(ea), "ok": True})
+            else:
+                results.append({"addr": hex(ea), "error": "Region not loaded"})
         except Exception as exc:
             results.append({"addr": hex(ea), "error": str(exc)})
 
@@ -607,7 +589,7 @@ def dsc_list_modules() -> dict:
 def dsc_load_all(
     region_type: Annotated[
         str,
-        'Region type to load: "module", "island", "mapping", "got", or "gap". '
+        'Region type to load: "island", "mapping", "got", or "gap". '
         "All items of the specified type will be loaded without a GUI chooser.",
     ],
 ) -> dict:
@@ -619,11 +601,12 @@ def dsc_load_all(
     every marked item.
 
     Supported types:
-    - "module"  — load every module in the cache (can be very large!)
     - "island"  — load all branch islands (stub trampolines)
     - "mapping" — load all branch mappings (iOS 16+ stubs regions)
     - "got"     — load all global offset tables (iOS 16+)
     - "gap"     — load all gap regions
+
+    Use dsc_load_module to load individual modules by path.
 
     The current database must have been opened from a dyld shared cache using
     the "single module" option.
@@ -632,9 +615,7 @@ def dsc_load_all(
     region_type = region_type.strip().lower()
 
     try:
-        if region_type == "module":
-            return _load_all_modules()
-        elif region_type == "island":
+        if region_type == "island":
             return _load_all_islands()
         elif region_type == "mapping":
             return _load_all_mappings()
@@ -645,37 +626,24 @@ def dsc_load_all(
         else:
             return {
                 "error": f"Unknown region type: {region_type!r}. "
-                "Use: module, island, mapping, got, gap"
+                "Use: island, mapping, got, gap"
             }
     except Exception as exc:
         return {"error": str(exc)}
-
-
-def _load_all_modules() -> dict:
-    """Load every module in the cache via tag 't' pre-population."""
-    modules = _parse_dsc_modules()
-    if not modules:
-        return {"error": "No modules found in DSC header"}
-
-    node = _dscu_node()
-    val = struct.pack("<Q", 1)
-    for mod in modules:
-        node.supset(mod["index"], val, _TAG_MODULE)
-    _run_dscu(_MODE_LOAD_MODULE)
-    return {"ok": True, "loaded": len(modules)}
 
 
 def _load_all_islands() -> dict:
     """Load every branch island via tag 'g' pre-population."""
     count = _parse_dsc_branch_pool_count()
     if count == 0:
-        return {"error": "No branch pools found in DSC header"}
+        return {"ok": True, "loaded": 0, "message": "No branch pools found in DSC header"}
 
     node = _dscu_node()
     val = struct.pack("<Q", 1)
     for i in range(count):
         node.supset(i, val, _TAG_ISLAND)
-    _run_dscu(_MODE_LOAD_ISLAND)
+    # ignore_rc=True because dscu returns False in headless mode even on success
+    _run_dscu(_MODE_LOAD_ISLAND, ignore_rc=True)
     return {"ok": True, "loaded": count}
 
 
@@ -684,6 +652,10 @@ def _load_all_mappings() -> dict:
 
     Reads the '$ dscu' netnode tag 'r' to find regions with type RT_MAPPING,
     then pre-populates tag 'h' (start_addr → flag=1) and triggers mode 7.
+
+    Note: dscu's load_and_run_plugin returns False in headless/idalib mode
+    even when the load succeeds.  We verify success by checking whether
+    new segments were created at the expected addresses.
     """
     regions = _enumerate_dscu_regions(_RT_MAPPING)
     if not regions:
@@ -693,8 +665,14 @@ def _load_all_mappings() -> dict:
     flag_value = struct.pack("<Q", 1)
     for region in regions:
         node.supset(region["start"], flag_value, _TAG_MAPPING)
-    _run_dscu(_MODE_LOAD_MAPPING)
-    return {"ok": True, "loaded": len(regions)}
+    # ignore_rc=True because dscu returns False in headless mode even on success
+    _run_dscu(_MODE_LOAD_MAPPING, ignore_rc=True)
+
+    # Verify how many regions were actually loaded by checking segments.
+    loaded_count = sum(
+        1 for region in regions if ida_segment.getseg(region["start"]) is not None
+    )
+    return {"ok": True, "loaded": loaded_count}
 
 
 def _load_all_gots() -> dict:
@@ -702,29 +680,28 @@ def _load_all_gots() -> dict:
 
     Reads the '$ dscu' netnode tag 'r' to find regions with type RT_GOT,
     then pre-populates tag 'f' (start_addr → end_addr) and triggers mode 9.
+
+    Note: dscu's load_and_run_plugin returns False in headless/idalib mode
+    even when the load succeeds.  We verify success by checking whether
+    new segments were created at the expected addresses.
     """
     regions = _enumerate_dscu_regions(_RT_GOT)
     if not regions:
         return {"error": "No GOT regions found in dscu region table"}
 
-    region_details = [
-        {"start": hex(r["start"]), "end": hex(r["end"]), "size": hex(r["size"])}
-        for r in regions
-    ]
     node = _dscu_node()
     for region in regions:
         node.supset(
             region["start"], struct.pack("<Q", region["end"]), _TAG_GOT
         )
-    try:
-        _run_dscu(_MODE_LOAD_GOT)
-    except Exception as exc:
-        return {
-            "error": f"reload_file_ex failed after pre-populating "
-            f"{len(regions)} GOT region(s): {exc}",
-            "regions": region_details,
-        }
-    return {"ok": True, "loaded": len(regions)}
+    # ignore_rc=True because dscu returns False in headless mode even on success
+    _run_dscu(_MODE_LOAD_GOT, ignore_rc=True)
+
+    # Verify how many regions were actually loaded by checking segments.
+    loaded_count = sum(
+        1 for region in regions if ida_segment.getseg(region["start"]) is not None
+    )
+    return {"ok": True, "loaded": loaded_count}
 
 
 def _load_all_gaps() -> dict:
@@ -732,6 +709,10 @@ def _load_all_gaps() -> dict:
 
     Reads the '$ dscu' netnode tag 'r' to find regions with type RT_GAP,
     then pre-populates tag 'p' (start_addr → end_addr) and triggers mode 8.
+
+    Note: dscu's load_and_run_plugin returns False in headless/idalib mode
+    even when the load succeeds.  We verify success by checking whether
+    new segments were created at the expected addresses.
     """
     regions = _enumerate_dscu_regions(_RT_GAP)
     if not regions:
@@ -742,14 +723,14 @@ def _load_all_gaps() -> dict:
         node.supset(
             region["start"], struct.pack("<Q", region["end"]), _TAG_GAP
         )
-    try:
-        _run_dscu(_MODE_LOAD_GAP)
-    except Exception as exc:
-        return {
-            "error": f"reload_file_ex failed after pre-populating "
-            f"{len(regions)} gap region(s): {exc}",
-        }
-    return {"ok": True, "loaded": len(regions)}
+    # ignore_rc=True because dscu returns False in headless mode even on success
+    _run_dscu(_MODE_LOAD_GAP, ignore_rc=True)
+
+    # Verify how many regions were actually loaded by checking segments.
+    loaded_count = sum(
+        1 for region in regions if ida_segment.getseg(region["start"]) is not None
+    )
+    return {"ok": True, "loaded": loaded_count}
 
 
 # ---------------------------------------------------------------------------
@@ -762,26 +743,6 @@ def _load_all_gaps() -> dict:
 #
 # For headless/automated workflows, use dsc_load_all(type) instead.
 # ---------------------------------------------------------------------------
-
-
-@tool
-@idasync
-def dsc_load_dependency() -> dict:
-    """Open the dependency chooser to load modules that the current module depends on.
-
-    Shows a two-step chooser dialog in IDA: first select a base module,
-    then select which of its dependencies to load.  Requires IDA GUI.
-    For headless use, find dependency paths and use dsc_load_module instead.
-
-    The current database must have been opened from a dyld shared cache using
-    the "single module" option.
-    """
-    _ensure_dscu()
-    try:
-        _run_dscu(_MODE_LOAD_DEPENDENCY)
-        return {"ok": True}
-    except Exception as exc:
-        return {"error": str(exc)}
 
 
 @tool
@@ -801,12 +762,8 @@ def dsc_load_branch_island() -> dict:
     the "single module" option.
     """
     _ensure_dscu()
-    try:
-        _run_dscu(_MODE_LOAD_ISLAND)
-        return {"ok": True}
-    except Exception:
-        pass
-    # Chooser failed (headless mode) — load all islands instead.
+    # Always pre-populate and load — avoids state pollution from a failed
+    # direct _run_dscu call in headless mode.
     return _load_all_islands()
 
 
@@ -827,12 +784,8 @@ def dsc_load_branch_mapping() -> dict:
     the "single module" option.
     """
     _ensure_dscu()
-    try:
-        _run_dscu(_MODE_LOAD_MAPPING)
-        return {"ok": True}
-    except Exception:
-        pass
-    # Chooser failed (headless mode) — load all mappings instead.
+    # Always pre-populate and load — avoids state pollution from a failed
+    # direct _run_dscu call in headless mode.
     return _load_all_mappings()
 
 
@@ -853,12 +806,8 @@ def dsc_load_got() -> dict:
     the "single module" option.
     """
     _ensure_dscu()
-    try:
-        _run_dscu(_MODE_LOAD_GOT)
-        return {"ok": True}
-    except Exception:
-        pass
-    # Chooser failed (headless mode) — load all GOTs instead.
+    # Always pre-populate and load — avoids state pollution from a failed
+    # direct _run_dscu call in headless mode.
     return _load_all_gots()
 
 
@@ -878,10 +827,6 @@ def dsc_load_gap() -> dict:
     the "single module" option.
     """
     _ensure_dscu()
-    try:
-        _run_dscu(_MODE_LOAD_GAP)
-        return {"ok": True}
-    except Exception:
-        pass
-    # Chooser failed (headless mode) — load all gaps instead.
+    # Always pre-populate and load — avoids state pollution from a failed
+    # direct _run_dscu call in headless mode.
     return _load_all_gaps()
