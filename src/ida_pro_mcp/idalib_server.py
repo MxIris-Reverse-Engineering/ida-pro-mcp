@@ -279,6 +279,14 @@ def idalib_open_dsc(
         "0 loads only the module itself, -1 loads all dependencies. Default: 0.",
     ] = 0,
     run_auto_analysis: Annotated[bool, "Run automatic analysis on the binary"] = True,
+    wait_for_analysis: Annotated[
+        bool,
+        "Block until initial auto-analysis finishes.  Default False because "
+        "large DSCs can easily take longer than an MCP client's tool-call "
+        "timeout; the analysis queue will drain on the first subsequent "
+        "dsc_load_* call (those tools auto-wait internally) or when you "
+        "explicitly call idalib_warmup(wait_auto_analysis=True).",
+    ] = False,
     session_id: Annotated[
         Optional[str], "Custom session ID (auto-generated if not provided)"
     ] = None,
@@ -295,6 +303,11 @@ def idalib_open_dsc(
 
     The `dependency_depth` parameter controls how many transitive dependencies
     are pulled in automatically (default 0 = module only, use -1 for all).
+
+    By default this tool returns as soon as the database is open and does not
+    block on the full auto-analysis pass, which can take many minutes on a
+    large shared cache.  Pass `wait_for_analysis=True` to get the old blocking
+    behaviour.
     """
 
     try:
@@ -306,6 +319,7 @@ def idalib_open_dsc(
             idb_name=idb_name,
             dependency_depth=dependency_depth,
             run_auto_analysis=run_auto_analysis,
+            wait_for_analysis=wait_for_analysis,
             session_id=session_id,
         )
         session = manager.bind_context(context_id, opened_session_id, activate=True)

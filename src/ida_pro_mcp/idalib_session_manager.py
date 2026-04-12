@@ -131,6 +131,7 @@ class IDASessionManager:
         idb_name: Optional[str] = None,
         dependency_depth: int = 0,
         run_auto_analysis: bool = True,
+        wait_for_analysis: bool = False,
         session_id: Optional[str] = None,
     ) -> str:
         """Open a single module from a dyld shared cache file.
@@ -151,6 +152,12 @@ class IDASessionManager:
                       module's file name (last path component).
             dependency_depth: Depth of dependency loading (0 = module only, -1 = all)
             run_auto_analysis: Whether to run auto-analysis
+            wait_for_analysis: Whether to block on ``ida_auto.auto_wait`` until
+                      initial analysis finishes.  Defaults to False because
+                      DSCs are typically large and the wait can easily exceed
+                      MCP client-side tool-call timeouts.  When False the
+                      session is marked ``is_analyzing=True`` and subsequent
+                      dsc_load_* tools will auto-wait on their first call.
             session_id: Optional custom session ID (auto-generated if not provided)
 
         Returns:
@@ -246,13 +253,20 @@ class IDASessionManager:
             self._sessions[session_id] = session
             self._active_session_id = session_id
 
-            if run_auto_analysis:
+            if run_auto_analysis and wait_for_analysis:
                 logger.debug(
                     "Waiting for auto-analysis to complete (session: %s)", session_id
                 )
                 ida_auto.auto_wait()
                 session.is_analyzing = False
                 logger.info("Auto-analysis completed (session: %s)", session_id)
+            elif run_auto_analysis:
+                logger.info(
+                    "DSC opened without waiting for auto-analysis "
+                    "(session: %s) — queue will drain on the next dsc_load_* "
+                    "call or idalib_warmup(wait_auto_analysis=True).",
+                    session_id,
+                )
 
             logger.info(
                 "DSC session created: %s for %s (module=%s)",

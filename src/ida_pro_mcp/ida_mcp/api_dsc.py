@@ -38,6 +38,7 @@ import struct
 from typing import Annotated
 
 import idaapi
+import ida_auto
 import ida_nalt
 import ida_segment
 import idautils
@@ -100,7 +101,7 @@ def _ensure_dscu() -> None:
 
 
 def _run_dscu(mode: int, *, ignore_rc: bool = False) -> bool:
-    """Run the dscu plugin with the given mode.
+    """Run the dscu plugin with the given mode, then wait for auto-analysis.
 
     Returns the boolean result of load_and_run_plugin.
 
@@ -109,10 +110,17 @@ def _run_dscu(mode: int, *, ignore_rc: bool = False) -> bool:
     through without raising — this is needed for chooser-based modes
     (4/7/8/9) that return False in headless/idalib even when the
     underlying load operation succeeded.
+
+    The dscu plugin adds new segments but IDA's auto-analysis of the newly
+    mapped code happens asynchronously through the work queue.  We must
+    block on ``ida_auto.auto_wait`` before returning so callers can
+    immediately query functions, decompile code, or resolve xrefs in the
+    newly loaded regions.
     """
     result = idaapi.load_and_run_plugin(_DSCU_PLUGIN, mode)
     if not result and not ignore_rc:
         raise IDAError(f"dscu plugin failed to execute (mode {mode})")
+    ida_auto.auto_wait()
     return result
 
 
