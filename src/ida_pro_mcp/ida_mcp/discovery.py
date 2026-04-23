@@ -159,3 +159,28 @@ def discover_instances() -> list[InstanceInfo]:
 
     result.sort(key=lambda x: x.get("started_at", ""))
     return result
+
+
+# ---------------------------------------------------------------------------
+# Proxy helpers — shared by server.py and api_discovery.py
+# ---------------------------------------------------------------------------
+
+_PROXY_TIMEOUT_ENV = "IDA_MCP_PROXY_TIMEOUT_SEC"
+_DEFAULT_PROXY_TIMEOUT_SEC = 600.0
+
+
+def get_proxy_timeout_seconds() -> float:
+    """Return the HTTP timeout (in seconds) for inter-instance proxy calls.
+
+    Configurable via the ``IDA_MCP_PROXY_TIMEOUT_SEC`` environment variable.
+    The default (600 s) accommodates long-running analysis tools such as
+    ``dsc_load_all`` that can take well over a minute to complete.
+    """
+    value = os.getenv(_PROXY_TIMEOUT_ENV, "").strip()
+    if not value:
+        return _DEFAULT_PROXY_TIMEOUT_SEC
+    try:
+        parsed = float(value)
+    except ValueError:
+        return _DEFAULT_PROXY_TIMEOUT_SEC
+    return parsed if parsed > 0 else _DEFAULT_PROXY_TIMEOUT_SEC

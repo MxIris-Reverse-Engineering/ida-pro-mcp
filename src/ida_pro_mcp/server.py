@@ -33,13 +33,13 @@ except ImportError:
     )
 
 try:
-    from .ida_mcp.discovery import discover_instances, probe_instance
+    from .ida_mcp.discovery import discover_instances, get_proxy_timeout_seconds, probe_instance
 except ImportError:
     try:
-        from ida_mcp.discovery import discover_instances, probe_instance
+        from ida_mcp.discovery import discover_instances, get_proxy_timeout_seconds, probe_instance
     except ImportError:
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "ida_mcp"))
-        from discovery import discover_instances, probe_instance
+        from discovery import discover_instances, get_proxy_timeout_seconds, probe_instance
 
         sys.path.pop(0)
 
@@ -109,7 +109,7 @@ def _proxy_to_instance(host: str, port: int, payload: bytes | str | dict) -> dic
     elif isinstance(payload, str):
         payload = payload.encode("utf-8")
 
-    conn = http.client.HTTPConnection(host, port, timeout=30)
+    conn = http.client.HTTPConnection(host, port, timeout=get_proxy_timeout_seconds())
     try:
         conn.request(
             "POST",

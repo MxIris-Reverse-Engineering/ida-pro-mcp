@@ -15,7 +15,7 @@ import time
 from typing import Annotated, NotRequired, TypedDict
 
 from .rpc import tool, MCP_SERVER
-from .discovery import discover_instances, probe_instance
+from .discovery import discover_instances, get_proxy_timeout_seconds, probe_instance
 
 
 class InstanceSelectionResult(TypedDict, total=False):
@@ -158,7 +158,7 @@ def proxy_to_instance(host: str, port: int, payload: bytes) -> dict:
     Sets X-MCP-Proxied header so the target knows this is a forwarded request
     and won't follow its own redirect (preventing A→B→A loops).
     """
-    conn = http.client.HTTPConnection(host, port, timeout=30)
+    conn = http.client.HTTPConnection(host, port, timeout=get_proxy_timeout_seconds())
     try:
         conn.request(
             "POST",

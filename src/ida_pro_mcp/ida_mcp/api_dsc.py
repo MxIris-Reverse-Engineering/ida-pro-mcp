@@ -483,7 +483,15 @@ def dsc_load_dyld_header() -> dict:
         _run_dscu(_MODE_LOAD_HEADER)
         return {"ok": True}
     except Exception as exc:
-        return {"error": str(exc)}
+        return {
+            "error": str(exc),
+            "hint": (
+                "dscu plugin mode 6 requires initial auto-analysis to have run. "
+                "If the database was opened with run_auto_analysis=False, call "
+                "idalib_warmup(wait_auto_analysis=True) first to drain the "
+                "analysis queue, then retry."
+            ),
+        }
 
 
 # ---------------------------------------------------------------------------
